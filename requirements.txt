@@ -1,0 +1,9 @@
+# Python 3.10+ (3.12 recommended). Installed into the lab venv by Install-Sut.ps1.
+fastapi>=0.115,<1
+uvicorn>=0.32,<1
+httpx>=0.27,<1
+prometheus-client>=0.21,<1
+psutil>=6.0
+opentelemetry-api>=1.30,<2
+opentelemetry-sdk>=1.30,<2
+opentelemetry-exporter-otlp-proto-http>=1.30,<2
