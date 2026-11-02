@@ -32,7 +32,11 @@ class Downstream:
         self._client = httpx.AsyncClient(
             base_url=base_url,
             timeout=httpx.Timeout(timeout_sec),
-            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
+            # Keep every pooled connection alive. With a lower keep-alive limit,
+            # connections above it are closed after each request and reopened for
+            # the next one; at design load the gateway has ~100 calls to products
+            # in flight, so most product calls paid for a new connection.
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=200),
             # Peers are always on loopback. Without this, httpx would also pick up a proxy from
             # HTTP(S)_PROXY or, on Windows, from the system (registry) proxy settings.
             trust_env=False,
