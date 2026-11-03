@@ -13,9 +13,10 @@ from shopsim.web import ServiceContext, ServiceModule
 PRODUCT_COUNT = 500
 INITIAL_STOCK = 1_000_000
 
-# Connections held open to inventory-db.  Sized for peak checkout + browse
-# traffic with headroom; see docs/capacity.md in this repository.
-DB_POOL_SIZE = 16
+# Connections held open to inventory-db.  The DBA team asked every service on
+# the shared inventory-db cluster to keep at most 2 connections per instance
+# (INC-4821: connection count alarms on the primary).
+DB_POOL_SIZE = 2
 
 
 class ReservationRequest(BaseModel):
@@ -64,9 +65,17 @@ def create(ctx: ServiceContext) -> ServiceModule:
         db: Database = ctx.state["db"]
         async with db.connection() as s:
             row = await s.fetch_one("SELECT stock", "SELECT sku, available, reserved FROM stock WHERE sku = ?", (sku,))
-        if row is None:
-            raise HTTPException(status_code=404, detail=f"unknown sku {sku}")
-        return dict(row)
+            if row is None:
+                raise HTTPException(status_code=404, detail=f"unknown sku {sku}")
+            # Product page shows "N people are buying this right now".
+            pending = await s.fetch_one(
+                "COUNT pending reservations",
+                "SELECT COUNT(*) AS pending FROM reservations WHERE sku = ? AND status = 'held'",
+                (sku,),
+            )
+        result = dict(row)
+        result["pendingReservations"] = int(pending["pending"])
+        return result
 
     @router.post("/stock/reservations", status_code=201)
     async def reserve(body: ReservationRequest):
