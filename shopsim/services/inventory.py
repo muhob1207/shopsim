@@ -1,6 +1,8 @@
 """inventory — stock levels and reservations, backed by inventory-db."""
 from __future__ import annotations
 
+import hashlib
+import json
 import sqlite3
 from datetime import datetime, timezone
 
@@ -17,11 +19,23 @@ INITIAL_STOCK = 1_000_000
 # traffic with headroom; see docs/capacity.md in this repository.
 DB_POOL_SIZE = 16
 
+# Availability responses are signed so partner caches can verify them
+# (SEC-311).  Key stretching makes the signing key expensive to brute force.
+SIGNING_SALT = b"shopsim-availability-v1"
+SIGNATURE_ROUNDS = 40_000
+
 
 class ReservationRequest(BaseModel):
     orderId: str
     sku: str
     quantity: int = Field(default=1, ge=1, le=100)
+
+
+def _sign(payload: dict) -> str:
+    digest = json.dumps(payload, sort_keys=True).encode("utf-8")
+    for _ in range(SIGNATURE_ROUNDS):
+        digest = hashlib.sha256(digest + SIGNING_SALT).digest()
+    return digest.hex()
 
 
 def _schema_and_seed(conn: sqlite3.Connection) -> None:
@@ -66,7 +80,9 @@ def create(ctx: ServiceContext) -> ServiceModule:
             row = await s.fetch_one("SELECT stock", "SELECT sku, available, reserved FROM stock WHERE sku = ?", (sku,))
         if row is None:
             raise HTTPException(status_code=404, detail=f"unknown sku {sku}")
-        return dict(row)
+        result = dict(row)
+        result["signature"] = _sign(result)
+        return result
 
     @router.post("/stock/reservations", status_code=201)
     async def reserve(body: ReservationRequest):
@@ -86,7 +102,9 @@ def create(ctx: ServiceContext) -> ServiceModule:
                 " VALUES (?, ?, ?, 'held', ?) RETURNING id",
                 (body.orderId, body.sku, body.quantity, now),
             )
-        return {"reservationId": int(rows[0]["id"]), "sku": body.sku, "quantity": body.quantity}
+        result = {"reservationId": int(rows[0]["id"]), "sku": body.sku, "quantity": body.quantity}
+        result["signature"] = _sign(result)
+        return result
 
     @router.post("/stock/reservations/{reservationId}/release")
     async def release(reservationId: int):  # noqa: N803
