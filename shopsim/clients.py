@@ -1,7 +1,6 @@
 """Traced HTTP client for calls between shopsim services."""
 from __future__ import annotations
 
-import asyncio
 import logging
 import time
 from typing import Any
@@ -13,12 +12,6 @@ from opentelemetry.trace import SpanKind, Status, StatusCode
 from shopsim.logs import log
 from shopsim.metrics import APP_ERRORS, HTTP_CLIENT
 from shopsim.telemetry import tracer
-
-# Calls in flight to one peer.  Callers beyond this wait on a semaphore, which
-# costs nothing while they wait, instead of queueing inside httpx's connection
-# pool, whose bookkeeping grows with every queued request.  The pool holds
-# exactly this many connections and keeps all of them alive.
-MAX_CALLS_IN_FLIGHT = 18
 
 
 class DownstreamError(Exception):
@@ -36,12 +29,10 @@ class Downstream:
     def __init__(self, peer: str, base_url: str, *, timeout_sec: float, logger: logging.Logger) -> None:
         self.peer = peer
         self._logger = logger
-        self._timeout_sec = timeout_sec
-        self._slots = asyncio.Semaphore(MAX_CALLS_IN_FLIGHT)
         self._client = httpx.AsyncClient(
             base_url=base_url,
             timeout=httpx.Timeout(timeout_sec),
-            limits=httpx.Limits(max_connections=MAX_CALLS_IN_FLIGHT, max_keepalive_connections=MAX_CALLS_IN_FLIGHT),
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=50),
             # Peers are always on loopback. Without this, httpx would also pick up a proxy from
             # HTTP(S)_PROXY or, on Windows, from the system (registry) proxy settings.
             trust_env=False,
@@ -66,11 +57,6 @@ class Downstream:
         ``path`` is the concrete URL path; it defaults to the route.  4xx
         responses are returned to the caller; transport errors, timeouts and
         (by default) 5xx responses raise :class:`DownstreamError`.
-
-        The wait for a free slot is part of the client span and of
-        ``http_client_requests_seconds`` (the caller's view of the call) and is
-        bounded by the call's timeout; the span's ``downstream.slot_wait_ms``
-        attribute carries it separately.
         """
         url_path = path or route
         headers: dict[str, str] = {}
@@ -90,31 +76,10 @@ class Downstream:
             started = time.perf_counter()
             status = "error"
             try:
-                try:
-                    await asyncio.wait_for(self._slots.acquire(), timeout=timeout_sec or self._timeout_sec)
-                except asyncio.TimeoutError:
-                    status = "timeout"
-                    waited_ms = (time.perf_counter() - started) * 1000
-                    span.set_status(Status(StatusCode.ERROR, "no free connection slot"))
-                    APP_ERRORS.labels("downstream_timeout").inc()
-                    log(
-                        self._logger, logging.ERROR,
-                        f"call to {self.peer} {method} {route} timed out after {waited_ms:.0f} ms "
-                        f"waiting for one of {MAX_CALLS_IN_FLIGHT} connection slots",
-                        event="downstream_timeout", peer_service=self.peer, http_method=method,
-                        http_route=route, duration_ms=round(waited_ms, 1), error_type="TimeoutError",
-                    )
-                    raise DownstreamError(
-                        self.peer, route, 504, f"no free connection slot after {waited_ms:.0f} ms",
-                    ) from None
-                span.set_attribute("downstream.slot_wait_ms", round((time.perf_counter() - started) * 1000, 2))
-                try:
-                    resp = await self._client.request(
-                        method, url_path, json=json, params=params, headers=headers,
-                        timeout=httpx.Timeout(timeout_sec) if timeout_sec else httpx.USE_CLIENT_DEFAULT,
-                    )
-                finally:
-                    self._slots.release()
+                resp = await self._client.request(
+                    method, url_path, json=json, params=params, headers=headers,
+                    timeout=httpx.Timeout(timeout_sec) if timeout_sec else httpx.USE_CLIENT_DEFAULT,
+                )
                 status = str(resp.status_code)
             except httpx.TimeoutException as exc:
                 status = "timeout"
