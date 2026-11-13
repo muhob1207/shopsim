@@ -56,16 +56,13 @@ class JsonFormatter(logging.Formatter):
         return json.dumps(doc, default=str, ensure_ascii=False)
 
 
-def setup_logging(
-    *, service: str, version: str, env: str, instance: str, log_dir: Path, file_name: str | None = None,
-) -> logging.Logger:
-    """Log to ``<log_dir>/<file_name>`` (default ``<service>.log``) and warnings to stderr."""
+def setup_logging(*, service: str, version: str, env: str, instance: str, log_dir: Path) -> logging.Logger:
     log_dir.mkdir(parents=True, exist_ok=True)
     root = logging.getLogger()
     root.handlers.clear()
     root.setLevel(logging.INFO)
 
-    file_handler = logging.FileHandler(log_dir / (file_name or f"{service}.log"), encoding="utf-8")
+    file_handler = logging.FileHandler(log_dir / f"{service}.log", encoding="utf-8")
     file_handler.setFormatter(JsonFormatter(service=service, version=version, env=env, instance=instance))
     root.addHandler(file_handler)
 

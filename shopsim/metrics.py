@@ -10,22 +10,12 @@ needs to call a service "the bottleneck":
 
 Label names avoid ``uri``/``url``/``path`` on purpose: Perftelion's collectors
 drop those as high-cardinality (``SERVER_METRICS_DENY_LABELS``).
-
-A service that runs several worker processes uses prometheus_client's
-multi-process mode (``PROMETHEUS_MULTIPROC_DIR``, set by ``run.py``): every
-worker writes its values to files in that directory and ``/metrics``, served by
-whichever worker the scrape reaches, aggregates all of them.  Counters and
-histograms are summed.  CPU figures are summed over the live workers, because
-they share one CPU cap; memory figures report the largest worker, because the
-memory cap applies to each process.  Python's own ``python_*`` metrics are not
-exported in that mode.
 """
 from __future__ import annotations
 
 import os
 import threading
 import time
-from pathlib import Path
 
 os.environ.setdefault("PROMETHEUS_DISABLE_CREATED_SERIES", "True")
 
@@ -33,46 +23,34 @@ import psutil  # noqa: E402
 from prometheus_client import (  # noqa: E402
     CONTENT_TYPE_LATEST,
     REGISTRY,
-    CollectorRegistry,
     Counter,
     Gauge,
     Histogram,
     generate_latest,
-    multiprocess,
 )
 from prometheus_client.core import CounterMetricFamily, GaugeMetricFamily  # noqa: E402
 
 from shopsim.limits import AppliedLimits, total_memory_bytes  # noqa: E402
 
-_MULTIPROC_DIR = os.environ.get("PROMETHEUS_MULTIPROC_DIR")
-
 LATENCY_BUCKETS = (0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.15, 0.25, 0.5, 0.75, 1.0, 2.0, 3.0, 5.0, 10.0)
 WAIT_BUCKETS = (0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.0, 5.0)
 
-# ``multiprocess_mode`` only matters in multi-process mode; a single process ignores it.
 HTTP_SERVER = Histogram(
     "http_server_requests_seconds", "Inbound HTTP request duration",
     ["method", "route", "status"], buckets=LATENCY_BUCKETS,
 )
-HTTP_IN_FLIGHT = Gauge(
-    "http_server_requests_in_flight", "Inbound HTTP requests currently being served", multiprocess_mode="livesum",
-)
+HTTP_IN_FLIGHT = Gauge("http_server_requests_in_flight", "Inbound HTTP requests currently being served")
 HTTP_CLIENT = Histogram(
     "http_client_requests_seconds", "Outbound HTTP call duration to another shopsim service",
     ["peer", "method", "route", "status"], buckets=LATENCY_BUCKETS,
 )
-DB_POOL_SIZE = Gauge("sut_db_pool_size", "Configured database connection pool size", multiprocess_mode="livesum")
-DB_POOL_IN_USE = Gauge("sut_db_pool_in_use", "Database connections currently checked out", multiprocess_mode="livesum")
-DB_POOL_WAITING = Gauge(
-    "sut_db_pool_waiting", "Requests currently waiting for a database connection", multiprocess_mode="livesum",
-)
+DB_POOL_SIZE = Gauge("sut_db_pool_size", "Configured database connection pool size")
+DB_POOL_IN_USE = Gauge("sut_db_pool_in_use", "Database connections currently checked out")
+DB_POOL_WAITING = Gauge("sut_db_pool_waiting", "Requests currently waiting for a database connection")
 DB_POOL_WAIT = Histogram("sut_db_pool_wait_seconds", "Time spent waiting for a database connection", buckets=WAIT_BUCKETS)
 DB_QUERY = Histogram("sut_db_query_seconds", "Database statement duration", ["operation"], buckets=LATENCY_BUCKETS)
 APP_ERRORS = Counter("sut_app_errors", "Application errors by type", ["type"])
-INFO = Gauge(
-    "sut_info", "Static service information (value is always 1)", ["service", "version", "env", "commit"],
-    multiprocess_mode="livemax",
-)
+INFO = Gauge("sut_info", "Static service information (value is always 1)", ["service", "version", "env", "commit"])
 
 
 class _ResourceSampler:
@@ -140,101 +118,6 @@ class ProcessResourceCollector:
         )
 
 
-class _WorkerResourcePublisher:
-    """Multi-process counterpart of :class:`ProcessResourceCollector`.
-
-    A scrape reaches one worker, so a collector reading its own process would
-    report only that worker.  Instead each worker writes its figures every
-    couple of seconds into multi-process metrics that ``/metrics`` aggregates.
-    """
-
-    def __init__(self, limits: AppliedLimits, interval: float = 2.0) -> None:
-        self._limits = limits
-        self._proc = psutil.Process()
-        self._interval = interval
-        self._mem_cap = limits.memory_bytes or total_memory_bytes()
-
-        self._cpu_seconds = Counter("process_cpu_seconds", "Total user and system CPU time spent in seconds")
-        self._rss = Gauge(
-            "process_resident_memory_bytes", "Resident (working set) memory of the largest worker",
-            multiprocess_mode="livemax",
-        )
-        self._private = Gauge(
-            "process_private_memory_bytes",
-            "Committed private memory of the largest worker (what the job memory limit counts)",
-            multiprocess_mode="livemax",
-        )
-        self._threads = Gauge("process_threads", "OS threads in all workers", multiprocess_mode="livesum")
-        self._cores = Gauge(
-            "sut_cpu_cores_used", "CPU cores used by all workers, averaged over the last ~2 s",
-            multiprocess_mode="livesum",
-        )
-        self._cpu_ratio = Gauge(
-            "sut_cpu_utilization_of_limit_ratio", "CPU used divided by the CPU cap (1.0 = throttled at the cap)",
-            multiprocess_mode="livesum",
-        )
-        self._mem_ratio = Gauge(
-            "sut_memory_utilization_of_limit_ratio", "Committed memory of the largest worker divided by the memory cap",
-            multiprocess_mode="livemax",
-        )
-        Gauge(
-            "sut_cpu_limit_cores", "CPU cap applied to this service, in cores", multiprocess_mode="livemax",
-        ).set(float(limits.cpu_cores))
-        Gauge(
-            "sut_memory_limit_bytes", "Memory cap applied to each worker (host RAM when uncapped)",
-            multiprocess_mode="livemax",
-        ).set(float(self._mem_cap))
-        Gauge(
-            "sut_limits_enforced", "1 when the CPU/memory limits are enforced by the OS", multiprocess_mode="livemax",
-        ).set(1.0 if limits.enforced else 0.0)
-
-        t = self._proc.cpu_times()
-        self._last_cpu = t.user + t.system
-        self._last_wall = time.monotonic()
-        self._cpu_seconds.inc(self._last_cpu)
-        self._publish_memory()
-        threading.Thread(target=self._run, name="resource-publisher", daemon=True).start()
-
-    def _run(self) -> None:
-        while True:
-            time.sleep(self._interval)
-            t = self._proc.cpu_times()
-            cpu = t.user + t.system
-            wall = time.monotonic()
-            used = max(0.0, cpu - self._last_cpu)
-            self._cpu_seconds.inc(used)
-            dt = wall - self._last_wall
-            if dt > 0:
-                cores = used / dt
-                self._cores.set(round(cores, 4))
-                self._cpu_ratio.set(round(cores / max(self._limits.cpu_cores, 0.01), 4))
-            self._last_cpu, self._last_wall = cpu, wall
-            self._publish_memory()
-
-    def _publish_memory(self) -> None:
-        with self._proc.oneshot():
-            mem = self._proc.memory_info()
-            threads = self._proc.num_threads()
-        private = int(getattr(mem, "private", 0) or getattr(mem, "vms", 0))
-        self._rss.set(float(mem.rss))
-        self._private.set(float(private))
-        self._threads.set(float(threads))
-        self._mem_ratio.set(round(private / max(self._mem_cap, 1), 4))
-
-
-def _forget_dead_workers() -> None:
-    """Drop the live-gauge files of workers that died (uvicorn replaces a crashed worker)."""
-    pids: set[int] = set()
-    for path in Path(_MULTIPROC_DIR).glob("gauge_live*_*.db"):
-        try:
-            pids.add(int(path.stem.rsplit("_", 1)[1]))
-        except ValueError:
-            continue
-    for pid in pids:
-        if not psutil.pid_exists(pid):
-            multiprocess.mark_process_dead(pid, _MULTIPROC_DIR)
-
-
 def install(limits: AppliedLimits, *, service: str, version: str, env: str, commit: str) -> None:
     try:  # Linux only: avoid a duplicate process_cpu_seconds_total.
         from prometheus_client import PROCESS_COLLECTOR
@@ -242,17 +125,9 @@ def install(limits: AppliedLimits, *, service: str, version: str, env: str, comm
         REGISTRY.unregister(PROCESS_COLLECTOR)
     except Exception:  # noqa: BLE001
         pass
-    if _MULTIPROC_DIR:
-        _forget_dead_workers()
-        _WorkerResourcePublisher(limits)
-    else:
-        REGISTRY.register(ProcessResourceCollector(limits))
+    REGISTRY.register(ProcessResourceCollector(limits))
     INFO.labels(service, version, env, commit).set(1)
 
 
 def render() -> tuple[bytes, str]:
-    if _MULTIPROC_DIR:
-        registry = CollectorRegistry()
-        multiprocess.MultiProcessCollector(registry)
-        return generate_latest(registry), CONTENT_TYPE_LATEST
     return generate_latest(REGISTRY), CONTENT_TYPE_LATEST
